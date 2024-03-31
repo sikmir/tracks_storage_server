@@ -1,38 +1,73 @@
 # coding: utf-8
-import hashlib
 import base64
+import codecs
+import dataclasses
+import hashlib
+import json
+import logging
+import re
+import uuid
+from typing import Any, NamedTuple, TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from wsgiref.types import StartResponse, WSGIEnvironment
+
 import msgpack
 import psycopg2
-import re
-import logging
-import uuid
-import json
-import codecs
+from psycopg2._psycopg import connection
 
 import config
 from nktk_raw_pb2 import TrackView
-
 
 MAX_STORE_SIZE = 1000000
 
 
 log = logging.getLogger(__name__)
-log_level = getattr(logging, config.log['level'])
+log_level = getattr(logging, config.log['level'])  # type: ignore[arg-type]
 log.setLevel(log_level)
-if not config.log.get('file'):
+
+log_handler: logging.Handler
+
+log_file = config.log.get('file')
+if not log_file:
     log_handler = logging.StreamHandler()
 else:
-    log_handler = logging.FileHandler(config.log['file'])
+    log_handler = logging.FileHandler(log_file)
 log_handler.setLevel(log_level)
 log_formatter = logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
 log_handler.setFormatter(log_formatter)
 log.addHandler(log_handler)
 
 
-_connection = None
+_connection: connection | None = None
 
 
-def check_connection(conn):
+class TrackRefViewMsgpackEncoded(bytes):
+    ...
+
+
+class ViewDataProtobufEncoded(bytes):
+    ...
+
+
+class GeoDataProtobufEncoded(bytes):
+    ...
+
+
+class TrackViewsNakarteEncoded(bytes):
+    ...
+
+class TrackViewTuple(NamedTuple):
+    view_data: ViewDataProtobufEncoded
+    geodata: GeoDataProtobufEncoded
+
+
+class TrackRefViewTuple(NamedTuple):
+    view_data: ViewDataProtobufEncoded
+    geodata_id: int
+
+
+def check_connection(conn: connection) -> bool:
     try:
         conn.cursor().execute('SELECT 1')
         return True
@@ -40,18 +75,23 @@ def check_connection(conn):
         return False
 
 
-def get_connection():
+def get_connection() -> connection:
     global _connection
     if not _connection or _connection.closed or not check_connection(_connection):
-        _connection = psycopg2.connect(**config.db)
+        _connection = psycopg2.connect(
+            host=config.db.get('host'),
+            port=config.db.get('port'),
+            user=config.db.get('user'),
+            password=config.db.get('password'),
+            dbname=config.db.get('dbname'),
+        )
         _connection.set_session(autocommit=True)
     return _connection
 
 
-def insert_geodata(data):
+def insert_geodata(data: GeoDataProtobufEncoded) -> int:
     table_name = 'geodata'
     connection = get_connection()
-    data = buffer(data)
     with connection.cursor() as cursor:
         sql = 'INSERT INTO %s (data) VALUES (%%s) ON CONFLICT DO NOTHING RETURNING id' % table_name
         cursor.execute(sql, (data,))
@@ -61,27 +101,35 @@ def insert_geodata(data):
             cursor.execute(sql, (data,))
             res = cursor.fetchone()
             assert res
+    assert isinstance(res[0], int)
     return res[0]
 
 
-def insert_trackview(data, data_hash):
+@dataclasses.dataclass(frozen=True)
+class InsertTrackviewResult:
+    id: int
+    is_new: bool
+
+
+def insert_trackview(data: TrackRefViewMsgpackEncoded, data_hash: str) -> InsertTrackviewResult:
     table_name = 'trackview'
     connection = get_connection()
-    data = buffer(data)
     with connection.cursor() as cursor:
         sql = 'INSERT INTO %s (data, hash) VALUES (%%s, %%s) ON CONFLICT DO NOTHING RETURNING id' % table_name
         cursor.execute(sql, (data, data_hash))
         res = cursor.fetchone()
-        is_new = bool(res)
-        if not is_new:
+        if res is None:
+            is_new = False
             sql = 'SELECT id FROM %s WHERE hash=%%s' % table_name
             cursor.execute(sql, (data_hash,))
             res = cursor.fetchone()
-            assert res
-    return {'id': res[0], 'is_new': is_new}
+            assert res is not None
+        else:
+            is_new = True
+    return InsertTrackviewResult(id=res[0], is_new=is_new)
 
 
-def select_geodata(id_):
+def select_geodata(id_: int) -> GeoDataProtobufEncoded | None:
     table_name = 'geodata'
     connection = get_connection()
     with connection.cursor() as cursor:
@@ -89,10 +137,18 @@ def select_geodata(id_):
         cursor.execute(sql, (id_,))
         res = cursor.fetchone()
         if res:
-            return str(res[0])
+            assert isinstance(res[0], memoryview)
+            return GeoDataProtobufEncoded(res[0])
+    return None
 
 
-def select_trackview(data_hash):
+@dataclasses.dataclass(frozen=True)
+class TrackViewProtobufWithId:
+    id: int
+    data: TrackRefViewMsgpackEncoded
+
+
+def select_trackview(data_hash: str) -> TrackViewProtobufWithId | None:
     table_name = 'trackview'
     connection = get_connection()
     with connection.cursor() as cursor:
@@ -100,97 +156,103 @@ def select_trackview(data_hash):
         cursor.execute(sql, (data_hash,))
         res = cursor.fetchone()
         if res:
-            return {'id': res[0], 'data': str(res[1])}
+            assert isinstance(res[1], memoryview)
+            return TrackViewProtobufWithId(id=res[0], data=TrackRefViewMsgpackEncoded(res[1]))
+    return None
 
 
-def decode_url_safe_base64(s):
-    return s.replace('-', '+').replace('_', '/').decode('base64')
-
-
-def encode_url_safe_base64(s):
-    return base64.standard_b64encode(s).replace('+', '-').replace('/', '_')
-
-
-def parse_trackviews_from_request(s):
+def parse_trackviews_from_request(nakarte_track: TrackViewsNakarteEncoded) -> list[TrackViewTuple]:
     result = []
-    for part in s.split('/'):
+    for part in nakarte_track.split(b'/'):
         if not part:
             continue
         tv = TrackView()
-        s = decode_url_safe_base64(part)
-        version = ord(s[0]) - 64
+        s = base64.urlsafe_b64decode(part)
+        version = s[0] - 64
         if version != 4:
             raise ValueError('Unknown version %s' % version)
         tv.ParseFromString(s[1:])
-        result.append((tv.view, tv.track))
+        result.append(
+            TrackViewTuple(
+                ViewDataProtobufEncoded(tv.view),
+                GeoDataProtobufEncoded(tv.track)),
+        )
     return result
 
 
-def offload_geodata(trackviews):
+def offload_geodata(trackviews: list[TrackViewTuple]) -> list[TrackRefViewTuple]:
     result = []
     for view_data, track_data in trackviews:
         geodata_id = insert_geodata(track_data)
-        result.append((view_data, geodata_id))
+        result.append(TrackRefViewTuple(view_data, geodata_id))
     return result
 
 
-def serialize_trackviews_for_storage(trackviews):
-    return msgpack.dumps(trackviews)
+def serialize_trackviews_for_storage(trackviews: list[TrackRefViewTuple]) -> TrackRefViewMsgpackEncoded:
+    return TrackRefViewMsgpackEncoded(msgpack.dumps(trackviews))
 
 
-def serialize_trackviews_for_response(trackviews):
+def serialize_trackviews_for_response(trackviews: list[TrackViewTuple]) -> TrackViewsNakarteEncoded:
     version = 4
-    version_char = chr(version + 64)
+    version_char = bytes([version + 64])
     res = []
     for view_data, geodata in trackviews:
         tv = TrackView()
         tv.view = view_data
         tv.track = geodata
-        s = encode_url_safe_base64(version_char + tv.SerializeToString())
+        s = base64.urlsafe_b64encode(version_char + tv.SerializeToString())
         res.append(s)
-    return '/'.join(res)
+    return TrackViewsNakarteEncoded(b'/'.join(res))
 
 
-def parse_trackviews_from_storage(s):
-    return msgpack.loads(s)
+def parse_trackviews_from_storage(s: TrackRefViewMsgpackEncoded) -> list[TrackRefViewTuple]:
+    return cast(list[TrackRefViewTuple], msgpack.loads(s))
 
 
-def load_geodata(trackviews):
+def load_geodata(trackviews: list[TrackRefViewTuple]) -> list[TrackViewTuple]:
     result = []
     for view_data, geodata_id in trackviews:
         geodata = select_geodata(geodata_id)
-        result.append((view_data, geodata))
+        if geodata is None:
+            raise Exception(f'Geodata with id={geodata_id} not found')
+        result.append(TrackViewTuple(view_data, geodata))
     return result
 
 
-def store_track(tracks, data_hash):
-    tracks = offload_geodata(tracks)
-    s = serialize_trackviews_for_storage(tracks)
+def store_track(trackviews: list[TrackViewTuple], data_hash: str) -> InsertTrackviewResult:
+    trackrefviews = offload_geodata(trackviews)
+    s = serialize_trackviews_for_storage(trackrefviews)
     return insert_trackview(s, data_hash)
 
 
-def retrieve_track(data_hash):
+@dataclasses.dataclass(frozen=True)
+class NakarteTrackWithId:
+    id: int
+    track: TrackViewsNakarteEncoded
+
+
+def retrieve_track(data_hash: str) -> NakarteTrackWithId | None:
     res = select_trackview(data_hash)
     if res is None:
         return None
-    tracks = parse_trackviews_from_storage(res['data'])
-    tracks = load_geodata(tracks)
-    s = serialize_trackviews_for_response(tracks)
-    return {'id': res['id'], 'track': s}
+    tracksrefviews = parse_trackviews_from_storage(res.data)
+    tracksviews = load_geodata(tracksrefviews)
+    s = serialize_trackviews_for_response(tracksviews)
+    return NakarteTrackWithId(id=res.id, track=s)
 
 
-def encode_hash(s):
-    return base64.standard_b64encode(s).replace('/', '_').replace('+', '-').rstrip('=')
+def encode_hash(s: bytes) -> str:
+    return base64.urlsafe_b64encode(s).rstrip(b'=').decode('ascii')
 
 
-def read_log(ip_addr, trackview_id):
+def read_log(ip_addr: str | None, trackview_id: int) -> None:
     connection = get_connection()
     with connection.cursor() as cursor:
         cursor.execute(
             "INSERT INTO read_log (ip_addr, time, trackview_id) VALUES (%s, 'now', %s)", (ip_addr, trackview_id))
 
 
-def write_log(ip_addr, trackview_id):
+def write_log(ip_addr: str | None, trackview_id: int) -> None:
     connection = get_connection()
     with connection.cursor() as cursor:
         cursor.execute(
@@ -198,7 +260,7 @@ def write_log(ip_addr, trackview_id):
             (ip_addr, trackview_id))
 
 
-class Application(object):
+class Application:
     STATUS_OK = '200 OK'
     STATUS_NOT_FOUND = '404', 'Not Found'
     STATUS_LENGTH_REQUIRED = '411', 'Length Required'
@@ -206,15 +268,15 @@ class Application(object):
     STATUS_BAD_REQUEST = '400', 'Bad Request'
     STATUS_INTERNAL_SERVER_ERROR = '500', 'Internal Server Error'
 
-    def __init__(self, environ, start_response):
+    def __init__(self, environ: dict[str, Any], start_response: "StartResponse"):
         self.environ = environ
         self._start_response = start_response
-        request_id = environ.get('REQUEST_ID')
+        request_id: str | None = environ.get('REQUEST_ID')
         if not request_id:
-            request_id = uuid.uuid4().get_hex()
+            request_id = uuid.uuid4().hex
         self.request_id = request_id
 
-    def log(self, level, message='', **extra):
+    def log(self, level: str, message: str = '', **extra: str | int  | dict[str, str]) -> None:
         extra = dict(extra, request_id=self.request_id)
         message += ' ' + json.dumps(extra)
         if level == 'EXCEPTION':
@@ -222,12 +284,12 @@ class Application(object):
         else:
             log.log(getattr(logging, level), message)
 
-    def start_response(self, status, headers):
+    def start_response(self, status: str, headers: list[tuple[str, str]]) -> None:
         headers = headers[:]
         headers.append(('Access-Control-Allow-Origin', '*'))
         self._start_response(status, headers)
 
-    def handle_store_track(self, request_data_hash):
+    def handle_store_track(self, request_data_hash: str) -> list[bytes]:
         self.log('INFO', 'Storing track')
         try:
             size = int(self.environ['CONTENT_LENGTH'])
@@ -237,8 +299,8 @@ class Application(object):
         if size > MAX_STORE_SIZE:
             self.log('INFO', 'Request content_length too big', max_size=MAX_STORE_SIZE, content_length=size)
             return self.error(self.STATUS_PAYLOAD_TOO_LARGE)
-        data = self.environ['wsgi.input'].read(size)
-        self.log('INFO', request_body=data)
+        data: TrackViewsNakarteEncoded = self.environ['wsgi.input'].read(size)
+        self.log('INFO', request_body=data.decode('raw_unicode_escape'))
         if len(data) != size:
             self.log('INFO', 'Request body smaller then content-lenght', content_length=size, body_size=len(data))
             return self.error(self.STATUS_BAD_REQUEST)
@@ -261,19 +323,20 @@ class Application(object):
         except:
             self.log('EXCEPTION', 'Error storing track')
             return self.error(self.STATUS_INTERNAL_SERVER_ERROR)
-        if res['is_new']:
+        if res.is_new:
             self.log('INFO', 'Stored new track')
         else:
             self.log('INFO', 'Track found in storage')
         self.log('INFO', 'Success storing track')
         try:
-            write_log(self.environ.get('REMOTE_ADDR'), res['id'])
+            addr: str = self.environ['REMOTE_ADDR']
+            write_log(addr, res.id)
         except:
             self.log('EXCEPTION', 'Error writing write-log')
         self.start_response(self.STATUS_OK, [])
-        return ['']
+        return [b'']
 
-    def handle_retrieve_track(self, hash):
+    def handle_retrieve_track(self, hash: str) -> list[bytes]:
         self.log('INFO', 'Retreiving track')
         try:
             res = retrieve_track(hash)
@@ -285,31 +348,34 @@ class Application(object):
             return self.error(self.STATUS_NOT_FOUND)
         self.log('INFO', 'Success retrieving track')
         try:
-            read_log(self.environ.get('REMOTE_ADDR'), res['id'])
+            addr: str = self.environ['REMOTE_ADDR']
+            read_log(addr, res.id)
         except:
             self.log('EXCEPTION', 'Error writing read-log')
         self.start_response(self.STATUS_OK, [])
-        return [res['track']]
+        return [bytes(res.track)]
 
-    def error(self, status):
+    def error(self, status: tuple[str, str]) -> list[bytes]:
         self.start_response('%s %s' % status, [])
-        return [json.dumps({'requestId': self.request_id, 'status': status[1], 'code': status[0]})]
+        message = json.dumps({'requestId': self.request_id, 'status': status[1], 'code': status[0]})
+        return [message.encode('utf-8')]
 
-    def get_headers(self):
+    def get_headers(self) -> dict[str, str]:
         headers = {}
-        for k, v in self.environ.iteritems():
+        for k, v in self.environ.items():
             if k.startswith('HTTP_'):
                 k = codecs.unicode_escape_decode(k)[0]
                 v = codecs.unicode_escape_decode(v)[0]
                 headers[k[5:]] = v
         return headers
 
-    def route(self):
+    def route(self) -> list[bytes]:
         try:
-            method = self.environ['REQUEST_METHOD']
-            uri = self.environ['PATH_INFO']
+            method: str = self.environ['REQUEST_METHOD']
+            uri: str = self.environ['PATH_INFO']
+            addr: str = self.environ['REMOTE_ADDR']
             self.log('INFO', 'Request accepted', method=method, uri=uri, headers=self.get_headers(),
-                     remote_addr=self.environ['REMOTE_ADDR'])
+                     remote_addr=addr)
             if method == 'GET':
                 m = re.match(r'^/track/([A-Za-z0-9_-]+)$', uri)
                 if m:
@@ -328,7 +394,7 @@ class Application(object):
             return self.error(self.STATUS_INTERNAL_SERVER_ERROR)
 
 
-def application(environ, start_response):
+def application(environ: "WSGIEnvironment", start_response: "StartResponse") -> list[bytes]:
     return Application(environ, start_response).route()
 
 

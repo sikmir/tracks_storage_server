@@ -1,3 +1,4 @@
+syntax = "proto2";
 
 message TrackView {
     required bytes view = 1;
