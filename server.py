@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import uuid
-from typing import Any, NamedTuple, TYPE_CHECKING, cast
+from typing import Any, Dict, List, NamedTuple, Optional, TYPE_CHECKING, Tuple, Union, cast
 
 if TYPE_CHECKING:
     from wsgiref.types import StartResponse, WSGIEnvironment
@@ -39,7 +39,7 @@ log_handler.setFormatter(log_formatter)
 log.addHandler(log_handler)
 
 
-_connection: connection | None = None
+_connection: Optional[connection] = None
 
 
 class TrackRefViewMsgpackEncoded(bytes):
@@ -129,7 +129,7 @@ def insert_trackview(data: TrackRefViewMsgpackEncoded, data_hash: str) -> Insert
     return InsertTrackviewResult(id=res[0], is_new=is_new)
 
 
-def select_geodata(id_: int) -> GeoDataProtobufEncoded | None:
+def select_geodata(id_: int) -> Optional[GeoDataProtobufEncoded]:
     table_name = 'geodata'
     connection = get_connection()
     with connection.cursor() as cursor:
@@ -148,7 +148,7 @@ class TrackViewProtobufWithId:
     data: TrackRefViewMsgpackEncoded
 
 
-def select_trackview(data_hash: str) -> TrackViewProtobufWithId | None:
+def select_trackview(data_hash: str) -> Optional[TrackViewProtobufWithId]:
     table_name = 'trackview'
     connection = get_connection()
     with connection.cursor() as cursor:
@@ -161,7 +161,7 @@ def select_trackview(data_hash: str) -> TrackViewProtobufWithId | None:
     return None
 
 
-def parse_trackviews_from_request(nakarte_track: TrackViewsNakarteEncoded) -> list[TrackViewTuple]:
+def parse_trackviews_from_request(nakarte_track: TrackViewsNakarteEncoded) -> List[TrackViewTuple]:
     result = []
     for part in nakarte_track.split(b'/'):
         if not part:
@@ -180,7 +180,7 @@ def parse_trackviews_from_request(nakarte_track: TrackViewsNakarteEncoded) -> li
     return result
 
 
-def offload_geodata(trackviews: list[TrackViewTuple]) -> list[TrackRefViewTuple]:
+def offload_geodata(trackviews: List[TrackViewTuple]) -> List[TrackRefViewTuple]:
     result = []
     for view_data, track_data in trackviews:
         geodata_id = insert_geodata(track_data)
@@ -188,11 +188,11 @@ def offload_geodata(trackviews: list[TrackViewTuple]) -> list[TrackRefViewTuple]
     return result
 
 
-def serialize_trackviews_for_storage(trackviews: list[TrackRefViewTuple]) -> TrackRefViewMsgpackEncoded:
+def serialize_trackviews_for_storage(trackviews: List[TrackRefViewTuple]) -> TrackRefViewMsgpackEncoded:
     return TrackRefViewMsgpackEncoded(msgpack.dumps(trackviews))
 
 
-def serialize_trackviews_for_response(trackviews: list[TrackViewTuple]) -> TrackViewsNakarteEncoded:
+def serialize_trackviews_for_response(trackviews: List[TrackViewTuple]) -> TrackViewsNakarteEncoded:
     version = 4
     version_char = bytes([version + 64])
     res = []
@@ -205,11 +205,11 @@ def serialize_trackviews_for_response(trackviews: list[TrackViewTuple]) -> Track
     return TrackViewsNakarteEncoded(b'/'.join(res))
 
 
-def parse_trackviews_from_storage(s: TrackRefViewMsgpackEncoded) -> list[TrackRefViewTuple]:
-    return cast(list[TrackRefViewTuple], msgpack.loads(s))
+def parse_trackviews_from_storage(s: TrackRefViewMsgpackEncoded) -> List[TrackRefViewTuple]:
+    return cast(List[TrackRefViewTuple], msgpack.loads(s))
 
 
-def load_geodata(trackviews: list[TrackRefViewTuple]) -> list[TrackViewTuple]:
+def load_geodata(trackviews: List[TrackRefViewTuple]) -> List[TrackViewTuple]:
     result = []
     for view_data, geodata_id in trackviews:
         geodata = select_geodata(geodata_id)
@@ -219,7 +219,7 @@ def load_geodata(trackviews: list[TrackRefViewTuple]) -> list[TrackViewTuple]:
     return result
 
 
-def store_track(trackviews: list[TrackViewTuple], data_hash: str) -> InsertTrackviewResult:
+def store_track(trackviews: List[TrackViewTuple], data_hash: str) -> InsertTrackviewResult:
     trackrefviews = offload_geodata(trackviews)
     s = serialize_trackviews_for_storage(trackrefviews)
     return insert_trackview(s, data_hash)
@@ -231,7 +231,7 @@ class NakarteTrackWithId:
     track: TrackViewsNakarteEncoded
 
 
-def retrieve_track(data_hash: str) -> NakarteTrackWithId | None:
+def retrieve_track(data_hash: str) -> Optional[NakarteTrackWithId]:
     res = select_trackview(data_hash)
     if res is None:
         return None
@@ -245,14 +245,14 @@ def encode_hash(s: bytes) -> str:
     return base64.urlsafe_b64encode(s).rstrip(b'=').decode('ascii')
 
 
-def read_log(ip_addr: str | None, trackview_id: int) -> None:
+def read_log(ip_addr: Optional[str], trackview_id: int) -> None:
     connection = get_connection()
     with connection.cursor() as cursor:
         cursor.execute(
             "INSERT INTO read_log (ip_addr, time, trackview_id) VALUES (%s, 'now', %s)", (ip_addr, trackview_id))
 
 
-def write_log(ip_addr: str | None, trackview_id: int) -> None:
+def write_log(ip_addr: Optional[str], trackview_id: int) -> None:
     connection = get_connection()
     with connection.cursor() as cursor:
         cursor.execute(
@@ -268,15 +268,15 @@ class Application:
     STATUS_BAD_REQUEST = '400', 'Bad Request'
     STATUS_INTERNAL_SERVER_ERROR = '500', 'Internal Server Error'
 
-    def __init__(self, environ: dict[str, Any], start_response: "StartResponse"):
+    def __init__(self, environ: Dict[str, Any], start_response: "StartResponse"):
         self.environ = environ
         self._start_response = start_response
-        request_id: str | None = environ.get('REQUEST_ID')
+        request_id: Optional[str] = environ.get('REQUEST_ID')
         if not request_id:
             request_id = uuid.uuid4().hex
         self.request_id = request_id
 
-    def log(self, level: str, message: str = '', **extra: str | int  | dict[str, str]) -> None:
+    def log(self, level: str, message: str = '', **extra: Union[str, int, Dict[str, str]]) -> None:
         extra = dict(extra, request_id=self.request_id)
         message += ' ' + json.dumps(extra)
         if level == 'EXCEPTION':
@@ -284,12 +284,12 @@ class Application:
         else:
             log.log(getattr(logging, level), message)
 
-    def start_response(self, status: str, headers: list[tuple[str, str]]) -> None:
+    def start_response(self, status: str, headers: List[Tuple[str, str]]) -> None:
         headers = headers[:]
         headers.append(('Access-Control-Allow-Origin', '*'))
         self._start_response(status, headers)
 
-    def handle_store_track(self, request_data_hash: str) -> list[bytes]:
+    def handle_store_track(self, request_data_hash: str) -> List[bytes]:
         self.log('INFO', 'Storing track')
         try:
             size = int(self.environ['CONTENT_LENGTH'])
@@ -336,7 +336,7 @@ class Application:
         self.start_response(self.STATUS_OK, [])
         return [b'']
 
-    def handle_retrieve_track(self, hash: str) -> list[bytes]:
+    def handle_retrieve_track(self, hash: str) -> List[bytes]:
         self.log('INFO', 'Retreiving track')
         try:
             res = retrieve_track(hash)
@@ -355,12 +355,12 @@ class Application:
         self.start_response(self.STATUS_OK, [])
         return [bytes(res.track)]
 
-    def error(self, status: tuple[str, str]) -> list[bytes]:
+    def error(self, status: Tuple[str, str]) -> List[bytes]:
         self.start_response('%s %s' % status, [])
         message = json.dumps({'requestId': self.request_id, 'status': status[1], 'code': status[0]})
         return [message.encode('utf-8')]
 
-    def get_headers(self) -> dict[str, str]:
+    def get_headers(self) -> Dict[str, str]:
         headers = {}
         for k, v in self.environ.items():
             if k.startswith('HTTP_'):
@@ -369,7 +369,7 @@ class Application:
                 headers[k[5:]] = v
         return headers
 
-    def route(self) -> list[bytes]:
+    def route(self) -> List[bytes]:
         try:
             method: str = self.environ['REQUEST_METHOD']
             uri: str = self.environ['PATH_INFO']
@@ -394,7 +394,7 @@ class Application:
             return self.error(self.STATUS_INTERNAL_SERVER_ERROR)
 
 
-def application(environ: "WSGIEnvironment", start_response: "StartResponse") -> list[bytes]:
+def application(environ: "WSGIEnvironment", start_response: "StartResponse") -> List[bytes]:
     return Application(environ, start_response).route()
 
 
