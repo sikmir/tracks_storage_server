@@ -206,7 +206,14 @@ def serialize_trackviews_for_response(trackviews: List[TrackViewTuple]) -> Track
 
 
 def parse_trackviews_from_storage(s: TrackRefViewMsgpackEncoded) -> List[TrackRefViewTuple]:
-    return cast(List[TrackRefViewTuple], msgpack.loads(s))
+    view_data: bytes | str
+    geodata_id: int
+    result: List[TrackRefViewTuple] = []
+    for view_data, geodata_id in msgpack.loads(s):
+        if isinstance(view_data, str):
+            view_data = bytes(map(ord, view_data))
+        result.append(TrackRefViewTuple(ViewDataProtobufEncoded(view_data), geodata_id))
+    return result
 
 
 def load_geodata(trackviews: List[TrackRefViewTuple]) -> List[TrackViewTuple]:
